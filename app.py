@@ -1,8 +1,9 @@
-# app.py - Servidor puente para IQ Option
+# iq_bridge.py - Servidor puente para IQ Option
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from iqoptionapi.stable_api import IQ_Option
 import threading
+import time
 
 app = Flask(__name__)
 CORS(app)
@@ -28,17 +29,14 @@ def health():
 
 @app.route('/connect', methods=['POST'])
 def connect():
-    data = request.json or {}
-    email = data.get('email', '')
-    password = data.get('password', '')
-    
-    if not email or not password:
-        return jsonify({"success": False, "error": "Credenciales requeridas", "connected": False})
+    data = request.json
+    email = data.get('email')
+    password = data.get('password')
     
     try:
         iq, error = get_connection(email, password)
         if not iq:
-            return jsonify({"success": False, "error": error or "No se pudo conectar", "connected": False})
+            return jsonify({"success": False, "error": error})
         
         demo_balance = iq.get_balance()
         iq.change_balance("REAL")
@@ -49,17 +47,20 @@ def connect():
             "success": True,
             "connected": True,
             "balance_demo": demo_balance,
-            "balance_real": real_balance,
-            "currency": "USD"
+            "balance_real": real_balance
         })
     except Exception as e:
-        return jsonify({"success": False, "error": str(e), "connected": False})
+        return jsonify({"success": False, "error": str(e)})
 
-@app.route('/balance', methods=['POST'])
-def get_balance():
-    data = request.json or {}
-    email = data.get('email', '')
-    password = data.get('password', '')
+@app.route('/trade', methods=['POST'])
+def execute_trade():
+    data = request.json
+    email = data.get('email')
+    password = data.get('password')
+    asset = data.get('asset', 'EURUSD')
+    direction = data.get('direction', 'call')
+    amount = data.get('amount', 1)
+    duration = data.get('duration', 1)
     mode = data.get('mode', 'PRACTICE')
     
     try:
@@ -67,45 +68,8 @@ def get_balance():
         if not iq:
             return jsonify({"success": False, "error": error})
         
-        iq.change_balance(mode)
-        balance = iq.get_balance()
-        
-        return jsonify({"success": True, "balance": balance, "mode": mode})
-    except Exception as e:
-        return jsonify({"success": False, "error": str(e)})
-
-@app.route('/trade', methods=['POST'])
-def execute_trade():
-    data = request.json or {}
-    email = data.get('email', '')
-    password = data.get('password', '')
-    asset = data.get('asset', 'EURUSD')
-    direction = data.get('direction', 'call')
-    amount = float(data.get('amount', 1))
-    duration = int(data.get('duration', 1))
-    mode = data.get('mode', 'PRACTICE')
-    
-    try:
-        iq, error = get_connection(email, password)
-        if not iq:
-            return jsonify({"success": False, "error": error or "No conectado"})
-        
         with connection_locks.get(email, threading.Lock()):
             iq.change_balance(mode)
-            
-            # Verify asset is open
-            all_assets = iq.get_all_open_time()
-            asset_open = False
-            for opt_type in ['turbo', 'binary']:
-                if asset in all_assets.get(opt_type, {}):
-                    if all_assets[opt_type][asset].get('open'):
-                        asset_open = True
-                        break
-            
-            if not asset_open:
-                return jsonify({"success": False, "error": f"Activo {asset} cerrado o no disponible"})
-            
-            # Execute trade
             check, trade_id = iq.buy(amount, asset, direction, duration)
             
             if check:
@@ -117,37 +81,77 @@ def execute_trade():
                     "amount": amount
                 })
             else:
-                return jsonify({"success": False, "error": f"Operación rechazada: {trade_id}"})
-                
+                return jsonify({"success": False, "error": "No se pudo ejecutar"})
     except Exception as e:
         return jsonify({"success": False, "error": str(e)})
-        
+
 @app.route('/check_trade/<int:trade_id>', methods=['POST'])
 def check_trade(trade_id):
-    data = request.json or {}
-    email = data.get('email', '')
-    password = data.get('password', '')
+    data = request.json
+    email = data.get('email')
+    password = data.get('password')
     
     try:
         iq, error = get_connection(email, password)
         if not iq:
             return jsonify({"success": False, "error": error})
         
-        result = iq.check_win_v4(trade_id)
-        return jsonify({
-            "success": True,
-            "trade_id": trade_id,
-            "profit": result if result else 0,
-            "result": "win" if result and result > 0 else "loss" if result is not None else "pending"
-        })
+        # Method 1: check_win_v3 (most reliable)
+        try:
+            result = iq.check_win_v3(trade_id)
+            if result is not None:
+                profit = float(result)
+                return jsonify({
+                    "success": True,
+                    "trade_id": trade_id,
+                    "status": "closed",
+                    "profit": profit,
+                    "result": "win" if profit > 0 else "tie" if profit == 0 else "loss"
+                })
+        except:
+            pass
+        
+        # Method 2: get_async_order
+        order = iq.get_async_order(trade_id)
+        if order and order.get("name") == "option-closed":
+            msg = order.get("msg", {})
+            win = float(msg.get("win_enrolled_amount", 0))
+            enrolled = float(msg.get("enrolled_amount", 0))
+            profit = win - enrolled
+            return jsonify({
+                "success": True,
+                "trade_id": trade_id,
+                "status": "closed",
+                "profit": profit,
+                "result": "win" if profit > 0 else "tie" if profit == 0 else "loss"
+            })
+        
+        # Method 3: listinfodata
+        try:
+            iq.api.listinfodata.delete(trade_id)
+            iq.api.get_optioninfo_v2(10)
+            time.sleep(1)
+            info = iq.api.listinfodata.get(trade_id)
+            if info and info.get("win"):
+                win_status = info.get("win")
+                if win_status == "win":
+                    return jsonify({"success": True, "trade_id": trade_id, "status": "closed", "profit": float(info.get("profit", 0)), "result": "win"})
+                elif win_status == "loose":
+                    return jsonify({"success": True, "trade_id": trade_id, "status": "closed", "profit": -float(info.get("profit", 0)), "result": "loss"})
+                elif win_status == "equal":
+                    return jsonify({"success": True, "trade_id": trade_id, "status": "closed", "profit": 0, "result": "tie"})
+        except:
+            pass
+        
+        return jsonify({"success": True, "trade_id": trade_id, "status": "open", "profit": 0})
     except Exception as e:
         return jsonify({"success": False, "error": str(e)})
 
 @app.route('/assets', methods=['POST'])
 def get_assets():
-    data = request.json or {}
-    email = data.get('email', '')
-    password = data.get('password', '')
+    data = request.json
+    email = data.get('email')
+    password = data.get('password')
     
     try:
         iq, error = get_connection(email, password)
@@ -155,78 +159,13 @@ def get_assets():
             return jsonify({"success": False, "error": error})
         
         all_assets = iq.get_all_open_time()
+        open_assets = []
+        for t in ['binary', 'turbo']:
+            for name, data in all_assets.get(t, {}).items():
+                if data.get('open'):
+                    open_assets.append({"name": name, "type": t})
         
-        # Use dict to remove duplicates by name
-        seen = {}
-        for option_type in ['turbo', 'binary']:
-            for asset_name, asset_data in all_assets.get(option_type, {}).items():
-                if asset_data.get('open') and asset_name not in seen:
-                    seen[asset_name] = {
-                        "name": asset_name,
-                        "type": option_type,
-                        "payout": 80
-                    }
-        
-        return jsonify({"success": True, "assets": list(seen.values())})
-    except Exception as e:
-        return jsonify({"success": False, "error": str(e)})
-        
-@app.route('/candles', methods=['POST'])
-def get_candles():
-    data = request.json or {}
-    email = data.get('email', '')
-    password = data.get('password', '')
-    asset = data.get('asset', 'EURUSD')
-    timeframe = data.get('timeframe', 60)  # 60 = 1min, 300 = 5min, etc
-    count = data.get('count', 50)
-    
-    try:
-        iq, error = get_connection(email, password)
-        if not iq:
-            return jsonify({"success": False, "error": error})
-        
-        import time
-        end_time = time.time()
-        candles = iq.get_candles(asset, timeframe, count, end_time)
-        
-        return jsonify({
-            "success": True,
-            "candles": candles,
-            "asset": asset,
-            "timeframe": timeframe
-        })
-    except Exception as e:
-        return jsonify({"success": False, "error": str(e)})
-
-@app.route('/price', methods=['POST'])
-def get_price():
-    data = request.json or {}
-    email = data.get('email', '')
-    password = data.get('password', '')
-    asset = data.get('asset', 'EURUSD')
-    
-    try:
-        iq, error = get_connection(email, password)
-        if not iq:
-            return jsonify({"success": False, "error": error})
-        
-        # Subscribe to asset and get current price
-        iq.subscribe_strike_list(asset, 1)
-        import time
-        time.sleep(0.5)
-        
-        # Get realtime candle
-        candles = iq.get_realtime_candles(asset, 60)
-        if candles:
-            latest = list(candles.values())[-1] if candles else None
-            if latest:
-                return jsonify({
-                    "success": True,
-                    "price": latest.get('close', 0),
-                    "asset": asset
-                })
-        
-        return jsonify({"success": False, "error": "No se pudo obtener precio"})
+        return jsonify({"success": True, "assets": open_assets})
     except Exception as e:
         return jsonify({"success": False, "error": str(e)})
 
