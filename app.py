@@ -81,17 +81,31 @@ def execute_trade():
     password = data.get('password', '')
     asset = data.get('asset', 'EURUSD')
     direction = data.get('direction', 'call')
-    amount = data.get('amount', 1)
-    duration = data.get('duration', 1)
+    amount = float(data.get('amount', 1))
+    duration = int(data.get('duration', 1))
     mode = data.get('mode', 'PRACTICE')
     
     try:
         iq, error = get_connection(email, password)
         if not iq:
-            return jsonify({"success": False, "error": error})
+            return jsonify({"success": False, "error": error or "No conectado"})
         
         with connection_locks.get(email, threading.Lock()):
             iq.change_balance(mode)
+            
+            # Verify asset is open
+            all_assets = iq.get_all_open_time()
+            asset_open = False
+            for opt_type in ['turbo', 'binary']:
+                if asset in all_assets.get(opt_type, {}):
+                    if all_assets[opt_type][asset].get('open'):
+                        asset_open = True
+                        break
+            
+            if not asset_open:
+                return jsonify({"success": False, "error": f"Activo {asset} cerrado o no disponible"})
+            
+            # Execute trade
             check, trade_id = iq.buy(amount, asset, direction, duration)
             
             if check:
@@ -103,10 +117,11 @@ def execute_trade():
                     "amount": amount
                 })
             else:
-                return jsonify({"success": False, "error": "No se pudo ejecutar", "details": trade_id})
+                return jsonify({"success": False, "error": f"Operación rechazada: {trade_id}"})
+                
     except Exception as e:
         return jsonify({"success": False, "error": str(e)})
-
+        
 @app.route('/check_trade/<int:trade_id>', methods=['POST'])
 def check_trade(trade_id):
     data = request.json or {}
@@ -140,25 +155,22 @@ def get_assets():
             return jsonify({"success": False, "error": error})
         
         all_assets = iq.get_all_open_time()
-        profit_data = iq.get_all_profit()
         
-        open_assets = []
-        for option_type in ['binary', 'turbo']:
+        # Use dict to remove duplicates by name
+        seen = {}
+        for option_type in ['turbo', 'binary']:
             for asset_name, asset_data in all_assets.get(option_type, {}).items():
-                if asset_data.get('open'):
-                    payout = 80
-                    if asset_name in profit_data:
-                        payout = int(profit_data[asset_name].get(option_type, 80) * 100)
-                    open_assets.append({
+                if asset_data.get('open') and asset_name not in seen:
+                    seen[asset_name] = {
                         "name": asset_name,
                         "type": option_type,
-                        "payout": payout
-                    })
+                        "payout": 80
+                    }
         
-        return jsonify({"success": True, "assets": open_assets})
+        return jsonify({"success": True, "assets": list(seen.values())})
     except Exception as e:
         return jsonify({"success": False, "error": str(e)})
-
+        
 @app.route('/candles', methods=['POST'])
 def get_candles():
     data = request.json or {}
