@@ -1,167 +1,154 @@
-# iq_bridge.py - Servidor puente para IQ Option
+# iq_bridge.py - Servidor puente para IQ Option v2.0
+# Con conexión persistente, auto-reconnect y heartbeat
+
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from iqoptionapi.stable_api import IQ_Option
 import threading
+import time
 
 app = Flask(__name__)
 CORS(app)
 
-connections = {}
-connection_locks = {}
+# Conexión global persistente
+iq_connection = None
+iq_lock = threading.Lock()
+iq_credentials = {"email": None, "password": None}
+last_activity = time.time()
 
-def get_connection(email, password):
-    key = email
-    if key not in connections or not connections[key].check_connect():
+def ensure_connection(email, password):
+    global iq_connection, iq_credentials, last_activity
+    
+    with iq_lock:
+        last_activity = time.time()
+        
+        if iq_credentials["email"] != email:
+            iq_connection = None
+        
+        if iq_connection is not None:
+            if iq_connection.check_connect():
+                return iq_connection, None
+            else:
+                print("[IQ] Conexión perdida, reconectando...")
+                iq_connection = None
+        
+        print(f"[IQ] Conectando como {email}...")
         iq = IQ_Option(email, password)
         check, reason = iq.connect()
+        
         if check:
-            connections[key] = iq
-            connection_locks[key] = threading.Lock()
+            iq_connection = iq
+            iq_credentials = {"email": email, "password": password}
+            print("[IQ] Conectado exitosamente")
+            return iq, None
         else:
             return None, reason
-    return connections[key], None
+
+def heartbeat_thread():
+    global iq_connection, iq_credentials, last_activity
+    while True:
+        time.sleep(30)
+        with iq_lock:
+            if iq_connection is not None:
+                if time.time() - last_activity > 600:
+                    iq_connection = None
+                    continue
+                if not iq_connection.check_connect():
+                    try:
+                        iq = IQ_Option(iq_credentials["email"], iq_credentials["password"])
+                        check, _ = iq.connect()
+                        if check:
+                            iq_connection = iq
+                    except:
+                        pass
+
+heartbeat = threading.Thread(target=heartbeat_thread, daemon=True)
+heartbeat.start()
 
 @app.route('/health', methods=['GET'])
 def health():
-    return jsonify({"status": "ok", "service": "iq-bridge"})
+    connected = iq_connection.check_connect() if iq_connection else False
+    return jsonify({"status": "ok", "connected": connected})
 
 @app.route('/connect', methods=['POST'])
 def connect():
     data = request.json
-    email = data.get('email')
-    password = data.get('password')
+    iq, error = ensure_connection(data.get('email'), data.get('password'))
+    if not iq:
+        return jsonify({"success": False, "error": error})
     
-    if not email or not password:
-        return jsonify({"success": False, "error": "Credenciales requeridas"})
+    demo_balance = iq.get_balance()
+    iq.change_balance("REAL")
+    real_balance = iq.get_balance()
+    iq.change_balance("PRACTICE")
     
-    try:
-        iq, error = get_connection(email, password)
-        if not iq:
-            return jsonify({"success": False, "error": error or "No se pudo conectar"})
-        
-        demo_balance = iq.get_balance()
-        iq.change_balance("REAL")
-        real_balance = iq.get_balance()
-        iq.change_balance("PRACTICE")
-        
-        return jsonify({
-            "success": True,
-            "connected": True,
-            "balance_demo": demo_balance,
-            "balance_real": real_balance
-        })
-    except Exception as e:
-        return jsonify({"success": False, "error": str(e)})
+    return jsonify({
+        "success": True,
+        "connected": True,
+        "balance_demo": demo_balance,
+        "balance_real": real_balance
+    })
 
 @app.route('/trade', methods=['POST'])
 def execute_trade():
     data = request.json
-    email = data.get('email')
-    password = data.get('password')
-    asset = data.get('asset', 'EURUSD')
-    direction = data.get('direction', 'call')
-    amount = data.get('amount', 1)
-    duration = data.get('duration', 1)
-    mode = data.get('mode', 'PRACTICE')
+    iq, error = ensure_connection(data.get('email'), data.get('password'))
+    if not iq:
+        return jsonify({"success": False, "error": error})
     
-    try:
-        iq, error = get_connection(email, password)
-        if not iq:
-            return jsonify({"success": False, "error": error})
+    with iq_lock:
+        iq.change_balance(data.get('mode', 'PRACTICE'))
+        check, trade_id = iq.buy(
+            data.get('amount', 1),
+            data.get('asset', 'EURUSD'),
+            data.get('direction', 'call'),
+            data.get('duration', 1)
+        )
         
-        with connection_locks.get(email, threading.Lock()):
-            iq.change_balance(mode)
-            check, trade_id = iq.buy(amount, asset, direction, duration)
-            
-            if check:
-                return jsonify({
-                    "success": True,
-                    "trade_id": trade_id,
-                    "asset": asset,
-                    "direction": direction,
-                    "amount": amount
-                })
-            else:
-                return jsonify({"success": False, "error": "No se pudo ejecutar"})
-    except Exception as e:
-        return jsonify({"success": False, "error": str(e)})
+        if check:
+            return jsonify({"success": True, "trade_id": trade_id})
+        return jsonify({"success": False, "error": str(trade_id)})
 
 @app.route('/check_trade/<int:trade_id>', methods=['POST'])
 def check_trade(trade_id):
     data = request.json
-    email = data.get('email')
-    password = data.get('password')
+    iq, error = ensure_connection(data.get('email'), data.get('password'))
+    if not iq:
+        return jsonify({"success": False, "error": error})
     
     try:
-        iq, error = get_connection(email, password)
-        if not iq:
-            return jsonify({"success": False, "error": error})
-        
-        # Fast method: check_win_v3 (instant response)
-        try:
-            result = iq.check_win_v3(trade_id)
-            if result is not None:
-                profit = float(result)
-                return jsonify({
-                    "success": True,
-                    "trade_id": trade_id,
-                    "status": "closed",
-                    "profit": profit,
-                    "result": "win" if profit > 0 else "tie" if profit == 0 else "loss"
-                })
-        except:
-            pass
-        
-        # Fallback: get_async_order (also fast)
-        try:
-            order = iq.get_async_order(trade_id)
-            if order and order.get("name") == "option-closed":
-                msg = order.get("msg", {})
-                win = float(msg.get("win_enrolled_amount", 0))
-                enrolled = float(msg.get("enrolled_amount", 0))
-                profit = win - enrolled
-                return jsonify({
-                    "success": True,
-                    "trade_id": trade_id,
-                    "status": "closed",
-                    "profit": profit,
-                    "result": "win" if profit > 0 else "tie" if profit == 0 else "loss"
-                })
-        except:
-            pass
-        
-        # Still open
-        return jsonify({
-            "success": True,
-            "trade_id": trade_id,
-            "status": "open",
-            "profit": 0
-        })
-    except Exception as e:
-        return jsonify({"success": False, "error": str(e)})
+        result = iq.check_win_v3(trade_id)
+        if result is not None:
+            profit = float(result)
+            return jsonify({
+                "success": True,
+                "status": "closed",
+                "profit": profit,
+                "result": "win" if profit > 0 else "tie" if profit == 0 else "loss"
+            })
+    except:
+        pass
+    
+    return jsonify({"success": True, "status": "open", "profit": 0})
 
 @app.route('/assets', methods=['POST'])
 def get_assets():
     data = request.json
-    email = data.get('email')
-    password = data.get('password')
+    iq, error = ensure_connection(data.get('email'), data.get('password'))
+    if not iq:
+        return jsonify({"success": False, "error": error})
     
-    try:
-        iq, error = get_connection(email, password)
-        if not iq:
-            return jsonify({"success": False, "error": error})
-        
-        all_assets = iq.get_all_open_time()
-        open_assets = []
-        for t in ['binary', 'turbo']:
-            for name, data in all_assets.get(t, {}).items():
-                if data.get('open'):
-                    open_assets.append({"name": name, "type": t})
-        
-        return jsonify({"success": True, "assets": open_assets})
-    except Exception as e:
-        return jsonify({"success": False, "error": str(e)})
+    all_assets = iq.get_all_open_time()
+    open_assets = []
+    seen = set()
+    
+    for opt_type in ['turbo', 'binary']:
+        for name, info in all_assets.get(opt_type, {}).items():
+            if info.get('open') and name not in seen:
+                seen.add(name)
+                open_assets.append({"name": name, "type": opt_type})
+    
+    return jsonify({"success": True, "assets": open_assets})
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000)
+    app.run(host='0.0.0.0', port=5000, threaded=True)
