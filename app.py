@@ -122,67 +122,38 @@ def check_trade(trade_id):
     if not iq:
         return jsonify({"success": False, "error": error})
     
-    # Método 1: get_betinfo (más confiable)
     try:
-        is_success, bet_info = iq.get_betinfo(trade_id)
-        if is_success and bet_info:
-            # bet_info contiene win_amount, amount_enrolled, etc
-            win_amount = float(bet_info.get('win_amount', 0))
-            enrolled = float(bet_info.get('amount_enrolled', bet_info.get('amount', 0)))
-            status = bet_info.get('status', '')
-            
-            if status == 'closed' or win_amount > 0 or 'win' in str(bet_info).lower():
-                profit = win_amount - enrolled if win_amount > 0 else -enrolled
-                result = "win" if win_amount > enrolled else "tie" if win_amount == enrolled else "loss"
-                return jsonify({
-                    "success": True,
-                    "trade_id": trade_id,
-                    "status": "closed",
-                    "profit": profit,
-                    "result": result
-                })
-    except Exception as e:
-        print(f"get_betinfo error: {e}")
-    
-    # Método 2: check_win_v3 (blocking)
-    try:
-        result = iq.check_win_v3(trade_id)
-        if result is not None:
-            profit = float(result)
-            return jsonify({
-                "success": True,
-                "trade_id": trade_id,
-                "status": "closed",
-                "profit": profit,
-                "result": "win" if profit > 0 else "tie" if profit == 0 else "loss"
-            })
-    except Exception as e:
-        print(f"check_win_v3 error: {e}")
-    
-    # Método 3: get_optioninfo_v2
-    try:
-        options = iq.get_optioninfo_v2(10)
-        for opt in options.get('msg', {}).get('closed_options', []):
+        # Buscar en historial de operaciones cerradas
+        options = iq.get_optioninfo_v2(50)
+        closed = options.get('msg', {}).get('closed_options', [])
+        
+        for opt in closed:
             if opt.get('id') == trade_id:
-                win = float(opt.get('win_amount', 0))
-                enrolled = float(opt.get('amount_enrolled', 0))
-                profit = win - enrolled
+                # Campos posibles: win, win_amount, profit
+                win_amount = float(opt.get('win_amount', opt.get('win', opt.get('profit', 0))))
+                amount = float(opt.get('amount', opt.get('amount_enrolled', 1)))
+                profit = win_amount - amount
+                
+                if win_amount > amount:
+                    result = "win"
+                elif win_amount == amount:
+                    result = "tie"
+                else:
+                    result = "loss"
+                    profit = -amount
+                
                 return jsonify({
                     "success": True,
                     "trade_id": trade_id,
                     "status": "closed",
                     "profit": profit,
-                    "result": "win" if profit > 0 else "tie" if profit == 0 else "loss"
+                    "result": result,
+                    "raw": opt  # Debug: ver estructura real
                 })
+        
+        return jsonify({"success": True, "trade_id": trade_id, "status": "open"})
     except Exception as e:
-        print(f"get_optioninfo_v2 error: {e}")
-    
-    return jsonify({
-        "success": True,
-        "trade_id": trade_id,
-        "status": "open",
-        "profit": 0
-    })
+        return jsonify({"success": False, "error": str(e)})
 
 @app.route('/assets', methods=['POST'])
 def get_assets():
