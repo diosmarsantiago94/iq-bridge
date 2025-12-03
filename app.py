@@ -140,13 +140,81 @@ def get_assets():
             return jsonify({"success": False, "error": error})
         
         all_assets = iq.get_all_open_time()
+        profit_data = iq.get_all_profit()
+        
         open_assets = []
         for option_type in ['binary', 'turbo']:
             for asset_name, asset_data in all_assets.get(option_type, {}).items():
                 if asset_data.get('open'):
-                    open_assets.append({"name": asset_name, "type": option_type})
+                    payout = 80
+                    if asset_name in profit_data:
+                        payout = int(profit_data[asset_name].get(option_type, 80) * 100)
+                    open_assets.append({
+                        "name": asset_name,
+                        "type": option_type,
+                        "payout": payout
+                    })
         
         return jsonify({"success": True, "assets": open_assets})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)})
+
+@app.route('/candles', methods=['POST'])
+def get_candles():
+    data = request.json or {}
+    email = data.get('email', '')
+    password = data.get('password', '')
+    asset = data.get('asset', 'EURUSD')
+    timeframe = data.get('timeframe', 60)  # 60 = 1min, 300 = 5min, etc
+    count = data.get('count', 50)
+    
+    try:
+        iq, error = get_connection(email, password)
+        if not iq:
+            return jsonify({"success": False, "error": error})
+        
+        import time
+        end_time = time.time()
+        candles = iq.get_candles(asset, timeframe, count, end_time)
+        
+        return jsonify({
+            "success": True,
+            "candles": candles,
+            "asset": asset,
+            "timeframe": timeframe
+        })
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)})
+
+@app.route('/price', methods=['POST'])
+def get_price():
+    data = request.json or {}
+    email = data.get('email', '')
+    password = data.get('password', '')
+    asset = data.get('asset', 'EURUSD')
+    
+    try:
+        iq, error = get_connection(email, password)
+        if not iq:
+            return jsonify({"success": False, "error": error})
+        
+        # Subscribe to asset and get current price
+        iq.subscribe_strike_list(asset, 1)
+        import time
+        time.sleep(0.5)
+        
+        # Get realtime candle
+        candles = iq.get_realtime_candles(asset, 60)
+        if candles:
+            latest = list(candles.values())[-1] if candles else None
+            if latest:
+                return jsonify({
+                    "success": True,
+                    "price": latest.get('close', 0),
+                    "asset": asset
+                })
+        
+        return jsonify({"success": False, "error": "No se pudo obtener precio"})
     except Exception as e:
         return jsonify({"success": False, "error": str(e)})
 
