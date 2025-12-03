@@ -1,0 +1,5 @@
+flask==2.3.3
+flask-cors==4.0.0
+iqoptionapi==7.0
+websocket-client==1.6.4
+gunicorn==21.2.0
