@@ -1,5 +1,6 @@
-# iq_bridge.py - Servidor puente para IQ Option v2.0
-# Con conexión persistente, auto-reconnect y heartbeat
+# iq_bridge.py - Servidor puente para IQ Option v3.0
+# Con conexión persistente, verificación mejorada via get_betinfo
+# Despliega en Railway, Render, Heroku o cualquier VPS
 
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -29,7 +30,6 @@ def ensure_connection(email, password):
             if iq_connection.check_connect():
                 return iq_connection, None
             else:
-                print("[IQ] Conexión perdida, reconectando...")
                 iq_connection = None
         
         print(f"[IQ] Conectando como {email}...")
@@ -96,17 +96,23 @@ def execute_trade():
     if not iq:
         return jsonify({"success": False, "error": error})
     
+    asset = data.get('asset', 'EURUSD')
+    direction = data.get('direction', 'call')
+    amount = data.get('amount', 1)
+    duration = data.get('duration', 1)
+    mode = data.get('mode', 'PRACTICE')
+    
     with iq_lock:
-        iq.change_balance(data.get('mode', 'PRACTICE'))
-        check, trade_id = iq.buy(
-            data.get('amount', 1),
-            data.get('asset', 'EURUSD'),
-            data.get('direction', 'call'),
-            data.get('duration', 1)
-        )
+        iq.change_balance(mode)
+        check, trade_id = iq.buy(amount, asset, direction, duration)
         
         if check:
-            return jsonify({"success": True, "trade_id": trade_id})
+            return jsonify({
+                "success": True,
+                "trade_id": trade_id,
+                "asset": asset,
+                "direction": direction
+            })
         return jsonify({"success": False, "error": str(trade_id)})
 
 @app.route('/check_trade/<int:trade_id>', methods=['POST'])
@@ -116,20 +122,67 @@ def check_trade(trade_id):
     if not iq:
         return jsonify({"success": False, "error": error})
     
+    # Método 1: get_betinfo (más confiable)
+    try:
+        is_success, bet_info = iq.get_betinfo(trade_id)
+        if is_success and bet_info:
+            # bet_info contiene win_amount, amount_enrolled, etc
+            win_amount = float(bet_info.get('win_amount', 0))
+            enrolled = float(bet_info.get('amount_enrolled', bet_info.get('amount', 0)))
+            status = bet_info.get('status', '')
+            
+            if status == 'closed' or win_amount > 0 or 'win' in str(bet_info).lower():
+                profit = win_amount - enrolled if win_amount > 0 else -enrolled
+                result = "win" if win_amount > enrolled else "tie" if win_amount == enrolled else "loss"
+                return jsonify({
+                    "success": True,
+                    "trade_id": trade_id,
+                    "status": "closed",
+                    "profit": profit,
+                    "result": result
+                })
+    except Exception as e:
+        print(f"get_betinfo error: {e}")
+    
+    # Método 2: check_win_v3 (blocking)
     try:
         result = iq.check_win_v3(trade_id)
         if result is not None:
             profit = float(result)
             return jsonify({
                 "success": True,
+                "trade_id": trade_id,
                 "status": "closed",
                 "profit": profit,
                 "result": "win" if profit > 0 else "tie" if profit == 0 else "loss"
             })
-    except:
-        pass
+    except Exception as e:
+        print(f"check_win_v3 error: {e}")
     
-    return jsonify({"success": True, "status": "open", "profit": 0})
+    # Método 3: get_optioninfo_v2
+    try:
+        options = iq.get_optioninfo_v2(10)
+        for opt in options.get('msg', {}).get('closed_options', []):
+            if opt.get('id') == trade_id:
+                win = float(opt.get('win_amount', 0))
+                enrolled = float(opt.get('amount_enrolled', 0))
+                profit = win - enrolled
+                return jsonify({
+                    "success": True,
+                    "trade_id": trade_id,
+                    "status": "closed",
+                    "profit": profit,
+                    "result": "win" if profit > 0 else "tie" if profit == 0 else "loss"
+                })
+    except Exception as e:
+        print(f"get_optioninfo_v2 error: {e}")
+    
+    return jsonify({
+        "success": True,
+        "trade_id": trade_id,
+        "status": "open",
+        "profit": 0
+    })
 
 @app.route('/assets', methods=['POST'])
 def get_assets():
@@ -151,4 +204,5 @@ def get_assets():
     return jsonify({"success": True, "assets": open_assets})
 
 if __name__ == '__main__':
+    print("[IQ Bridge v3.0] Servidor con verificación mejorada...")
     app.run(host='0.0.0.0', port=5000, threaded=True)
