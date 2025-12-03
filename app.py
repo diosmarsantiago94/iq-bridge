@@ -3,7 +3,7 @@
 
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-from iqoptionapi.stable_api import IQ_Option
+from iqoptionapi.api import IQOptionAPI as IQ_Option
 import threading
 import time
 
