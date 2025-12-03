@@ -3,7 +3,6 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 from iqoptionapi.stable_api import IQ_Option
 import threading
-import time
 
 app = Flask(__name__)
 CORS(app)
@@ -33,10 +32,13 @@ def connect():
     email = data.get('email')
     password = data.get('password')
     
+    if not email or not password:
+        return jsonify({"success": False, "error": "Credenciales requeridas"})
+    
     try:
         iq, error = get_connection(email, password)
         if not iq:
-            return jsonify({"success": False, "error": error})
+            return jsonify({"success": False, "error": error or "No se pudo conectar"})
         
         demo_balance = iq.get_balance()
         iq.change_balance("REAL")
@@ -96,7 +98,7 @@ def check_trade(trade_id):
         if not iq:
             return jsonify({"success": False, "error": error})
         
-        # Method 1: check_win_v3 (most reliable)
+        # Fast method: check_win_v3 (instant response)
         try:
             result = iq.check_win_v3(trade_id)
             if result is not None:
@@ -111,39 +113,31 @@ def check_trade(trade_id):
         except:
             pass
         
-        # Method 2: get_async_order
-        order = iq.get_async_order(trade_id)
-        if order and order.get("name") == "option-closed":
-            msg = order.get("msg", {})
-            win = float(msg.get("win_enrolled_amount", 0))
-            enrolled = float(msg.get("enrolled_amount", 0))
-            profit = win - enrolled
-            return jsonify({
-                "success": True,
-                "trade_id": trade_id,
-                "status": "closed",
-                "profit": profit,
-                "result": "win" if profit > 0 else "tie" if profit == 0 else "loss"
-            })
-        
-        # Method 3: listinfodata
+        # Fallback: get_async_order (also fast)
         try:
-            iq.api.listinfodata.delete(trade_id)
-            iq.api.get_optioninfo_v2(10)
-            time.sleep(1)
-            info = iq.api.listinfodata.get(trade_id)
-            if info and info.get("win"):
-                win_status = info.get("win")
-                if win_status == "win":
-                    return jsonify({"success": True, "trade_id": trade_id, "status": "closed", "profit": float(info.get("profit", 0)), "result": "win"})
-                elif win_status == "loose":
-                    return jsonify({"success": True, "trade_id": trade_id, "status": "closed", "profit": -float(info.get("profit", 0)), "result": "loss"})
-                elif win_status == "equal":
-                    return jsonify({"success": True, "trade_id": trade_id, "status": "closed", "profit": 0, "result": "tie"})
+            order = iq.get_async_order(trade_id)
+            if order and order.get("name") == "option-closed":
+                msg = order.get("msg", {})
+                win = float(msg.get("win_enrolled_amount", 0))
+                enrolled = float(msg.get("enrolled_amount", 0))
+                profit = win - enrolled
+                return jsonify({
+                    "success": True,
+                    "trade_id": trade_id,
+                    "status": "closed",
+                    "profit": profit,
+                    "result": "win" if profit > 0 else "tie" if profit == 0 else "loss"
+                })
         except:
             pass
         
-        return jsonify({"success": True, "trade_id": trade_id, "status": "open", "profit": 0})
+        # Still open
+        return jsonify({
+            "success": True,
+            "trade_id": trade_id,
+            "status": "open",
+            "profit": 0
+        })
     except Exception as e:
         return jsonify({"success": False, "error": str(e)})
 
